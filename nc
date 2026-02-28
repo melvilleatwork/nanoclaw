@@ -6,8 +6,29 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG="$PROJECT_DIR/logs/nanoclaw.log"
 ERR_LOG="$PROJECT_DIR/logs/nanoclaw.error.log"
 
+refresh_token() {
+  local creds token
+  creds=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
+  if [ -z "$creds" ]; then
+    echo "Warning: Could not read Claude token from Keychain" >&2
+    return
+  fi
+  token=$(echo "$creds" | python3 -c "import sys,json; print(json.load(sys.stdin)['claudeAiOauth']['accessToken'])" 2>/dev/null)
+  if [ -z "$token" ]; then
+    echo "Warning: Could not parse Claude token" >&2
+    return
+  fi
+  # Update .env
+  sed -i '' "s|^CLAUDE_CODE_OAUTH_TOKEN=.*|CLAUDE_CODE_OAUTH_TOKEN=${token}|" "$PROJECT_DIR/.env"
+  # Sync to container env
+  mkdir -p "$PROJECT_DIR/data/env"
+  cp "$PROJECT_DIR/.env" "$PROJECT_DIR/data/env/env"
+  echo "Claude token refreshed"
+}
+
 case "${1:-help}" in
   start)
+    refresh_token
     launchctl load "$PLIST" 2>/dev/null
     echo "NanoClaw started"
     ;;
@@ -16,6 +37,7 @@ case "${1:-help}" in
     echo "NanoClaw stopped"
     ;;
   restart)
+    refresh_token
     launchctl kickstart -k "gui/$(id -u)/com.nanoclaw"
     echo "NanoClaw restarted"
     ;;
