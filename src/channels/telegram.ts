@@ -1,6 +1,10 @@
+import { mkdirSync, writeFileSync } from 'fs';
+import path from 'path';
+
 import { Bot } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { resolveGroupFolderPath } from '../group-folder.js';
 import { logger } from '../logger.js';
 import {
   Channel,
@@ -25,6 +29,40 @@ export class TelegramChannel implements Channel {
   constructor(botToken: string, opts: TelegramChannelOpts) {
     this.botToken = botToken;
     this.opts = opts;
+  }
+
+  /**
+   * Download a file from Telegram and save it into the group's uploads folder.
+   * Returns the container path (/workspace/group/uploads/...) or null on failure.
+   */
+  private async downloadFile(
+    fileId: string,
+    folder: string,
+    filename: string,
+  ): Promise<string | null> {
+    try {
+      const file = await this.bot!.api.getFile(fileId);
+      if (!file.file_path) return null;
+
+      const groupDir = resolveGroupFolderPath(folder);
+      const uploadsDir = path.join(groupDir, 'uploads');
+      mkdirSync(uploadsDir, { recursive: true });
+
+      const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+      const destName = `${Date.now()}-${safeName}`;
+      const destPath = path.join(uploadsDir, destName);
+
+      const url = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      writeFileSync(destPath, Buffer.from(await res.arrayBuffer()));
+
+      logger.info({ folder, destName }, 'Telegram file downloaded');
+      return `/workspace/group/uploads/${destName}`;
+    } catch (err) {
+      logger.warn({ err, fileId }, 'Failed to download Telegram file');
+      return null;
+    }
   }
 
   async connect(): Promise<void> {
@@ -163,13 +201,41 @@ export class TelegramChannel implements Channel {
       });
     };
 
-    this.bot.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
+    this.bot.on('message:photo', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+      const largest = ctx.message.photo[ctx.message.photo.length - 1];
+      const containerPath = await this.downloadFile(
+        largest.file_id,
+        group.folder,
+        'photo.jpg',
+      );
+      storeNonText(ctx, containerPath ? `[Photo: ${containerPath}]` : '[Photo]');
+    });
     this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
     this.bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
     this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
-    this.bot.on('message:document', (ctx) => {
-      const name = ctx.message.document?.file_name || 'file';
-      storeNonText(ctx, `[Document: ${name}]`);
+    this.bot.on('message:document', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+      const filename = ctx.message.document?.file_name || 'file';
+      const fileId = ctx.message.document?.file_id;
+      let content: string;
+      if (fileId) {
+        const containerPath = await this.downloadFile(
+          fileId,
+          group.folder,
+          filename,
+        );
+        content = containerPath
+          ? `[Document: ${filename} saved to ${containerPath}]`
+          : `[Document: ${filename}]`;
+      } else {
+        content = `[Document: ${filename}]`;
+      }
+      storeNonText(ctx, content);
     });
     this.bot.on('message:sticker', (ctx) => {
       const emoji = ctx.message.sticker?.emoji || '';
